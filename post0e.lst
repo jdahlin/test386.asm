@@ -1,0 +1,474 @@
+================================================================================
+POST E (0x0E) - 32-bit Addressing Modes (LEA) Test
+================================================================================
+
+This POST tests ALL possible 32-bit addressing modes using the LEA instruction.
+It systematically iterates through every valid ModRM byte value (0x00-0xBF) and
+for each ModRM value that requires a SIB byte, iterates through all 256 SIB
+byte combinations.
+
+Test Coverage:
+- 192 ModRM combinations (0x00-0xBF, values 0xC0-0xFF invalid for LEA)
+- Up to 256 SIB byte combinations for each SIB-requiring ModRM
+- 8-bit displacement (disp8) and 32-bit displacement (disp32) variations
+- Total: ~49,000+ unique addressing mode tests
+
+================================================================================
+POST E Entry Point (test386.lst lines 16500-16530)
+================================================================================
+
+; Output POST code 0x0E to diagnostic port
+000081B2  B00E              mov al, 0x0E
+000081B4  66BA9001          mov dx, 0x0190            ; POST_PORT
+000081B8  EE                out dx, al
+
+; Call the 32-bit addressing mode test function
+000081B9  E88BF0FFFF        call testAddressing32
+
+; Advance test segment protection (update LDT descriptor bases)
+; advTestSegProt macro expansion:
+;   Increment TEST_BASE1 and TEST_BASE2 by 0x1000
+;   Update LDT descriptors for D1_SEG_PROT and D2_SEG_PROT
+
+; updLDTDescBase D1_SEG_PROT,TEST_BASE1
+000081BE  2EC51D[001C0000]  lds ebx, [cs:ptrLDTprot]  ; Load LDT pointer
+000081C5  83C318            add ebx, 0x18             ; Offset to D1_SEG_PROT (0x18)
+000081C8  66C743020070      mov word [ebx+2], 0x7000  ; Base bits 15:0
+000081CE  C6430402          mov byte [ebx+4], 0x02    ; Base bits 23:16
+000081D2  C6430700          mov byte [ebx+7], 0x00    ; Base bits 31:24
+
+; updLDTDescBase D2_SEG_PROT,TEST_BASE2
+000081D6  2EC51D[001C0000]  lds ebx, [cs:ptrLDTprot]
+000081DD  83C320            add ebx, 0x20             ; Offset to D2_SEG_PROT (0x20)
+000081E0  66C743020070      mov word [ebx+2], 0x7000  ; Base bits 15:0
+000081E6  C6430406          mov byte [ebx+4], 0x06    ; Base bits 23:16
+000081EA  C6430700          mov byte [ebx+7], 0x00    ; Base bits 31:24
+
+; Set up segment registers for next test
+000081EE  66BA1C00          mov dx, 0x001C            ; D1_SEG_PROT
+000081F2  8EDA              mov ds, dx
+000081F4  66BA2400          mov dx, 0x0024            ; D2_SEG_PROT
+000081F8  8EC2              mov es, dx
+
+================================================================================
+testAddressing32 Function (test386.lst lines 15369-15453)
+================================================================================
+
+; This function tests all 32-bit addressing modes by:
+; 1. Copying a test routine template to a writable code segment
+; 2. Dynamically modifying the LEA instruction's ModRM/SIB bytes
+; 3. Executing the modified code to compute an effective address
+; 4. Comparing the result against pre-computed expected values
+
+testAddressing32:
+    ; Update dynamic code segment base to match D1_SEG_PROT base
+    ; updLDTDescBase DC_SEG_PROT32,TEST_BASE1
+00007249  2EC51D[001C0000]  lds ebx, [cs:ptrLDTprot]
+00007250  83C328            add ebx, 0x28             ; DC_SEG_PROT32 offset
+00007253  66C743020060      mov word [ebx+2], 0x6000  ; Base bits 15:0
+00007259  C6430402          mov byte [ebx+4], 0x02    ; Base bits 23:16
+0000725D  C6430700          mov byte [ebx+7], 0x00    ; Base bits 31:24
+
+    ; Copy test routine template to RAM
+00007261  B956000000        mov ecx, 0x56             ; Size: addr32TestCode.end - addr32TestCode
+00007266  66B81000          mov ax, 0x0010            ; C_SEG_PROT32 (source segment)
+0000726A  8ED8              mov ds, ax
+0000726C  BE[F3710000]      mov esi, addr32TestCode   ; Source offset
+00007271  66B81C00          mov ax, 0x001C            ; D1_SEG_PROT (dest segment)
+00007275  8EC0              mov es, ax
+00007277  BF00000000        mov edi, 0                ; Dest offset = 0
+0000727C  FC                cld
+0000727D  F3A4              rep movsb                 ; Copy template
+
+    ; Set up working segments
+0000727F  66B81C00          mov ax, 0x001C            ; D1_SEG_PROT
+00007283  8ED8              mov ds, ax                ; DS = writable code segment
+00007285  66B82400          mov ax, 0x0024            ; D2_SEG_PROT
+00007289  8EC0              mov es, ax                ; ES = scratch pad
+
+    ; Register usage:
+    ; AL  = LEA ModRM byte
+    ; AH  = LEA SIB byte
+    ; EAX bit 16 = SIB present flag
+    ; BL  = CMP ModRM byte
+    ; BH  = LEA last byte value
+    ; CX (low)  = ModRM loop counter
+    ; CX (high) = SIB loop counter
+    ; DL  = Index in CMP values table
+    ; DH  = ModRM of MOV instruction
+    ; ESI = LEA 8/32-bit displacement
+    ; EDI = LEA displacement value offset
+
+0000728B  31C0              xor eax, eax              ; Start with ModRM = 0
+0000728D  B9C0000001        mov ecx, 0x010000C0       ; ModRM: 192 values (0-BF), SIB: 256
+
+.calcModRMValues:
+00007292  E862000000        call addr32CalcLEAValues  ; Calculate LEA encoding
+00007297  E8E8000000        call addr32CalcCMPValues  ; Calculate expected result
+0000729C  E822010000        call addr32CalcMOVValues  ; Calculate MOV encoding
+000072A1  E826010000        call addr32CopyValues     ; Write values to test routine
+
+    ; Skip undefined behavior cases (Index=4 with SS!=0)
+000072A6  A900000100        test eax, 0x10000         ; SIB used?
+000072AB  7423              jz .runTest               ; No SIB, run test
+000072AD  6689C5            mov bp, ax
+000072B0  66C1ED08          shr bp, 8                 ; BP = SIB byte
+000072B4  6683E538          and bp, 0x38              ; Select Index field
+000072B8  6683FD20          cmp bp, 0x20              ; Index = 4 (ESP)?
+000072BC  7512              jne .runTest              ; No, run test
+000072BE  6689C5            mov bp, ax
+000072C1  66C1ED08          shr bp, 8
+000072C5  6681E5C000        and bp, 0xC0              ; Select Scale field
+000072CA  6683FD00          cmp bp, 0                 ; Scale = 0?
+000072CE  7507              jne .endTest              ; No, skip (undefined behavior)
+
+.runTest:
+000072D0  9A000000002C00    call DC_SEG_PROT32:0      ; Execute test routine
+
+.endTest:
+000072D7  A900000100        test eax, 0x10000         ; SIB used?
+000072DC  7504              jnz .nextSIB
+
+.nextModRM:
+000072DE  FEC0              inc al                    ; Next ModRM value
+000072E0  EB13              jmp .loop
+
+.nextSIB:
+000072E2  FEC4              inc ah                    ; Next SIB value
+000072E4  67E2AB            a16 loop .calcModRMValues ; Decrement CX (SIB counter)
+    ; SIB loop complete
+000072E7  25FFFF0000        and eax, 0x0FFFF          ; Clear SIB flag
+000072EC  66B90001          mov cx, 0x100             ; Reset SIB counter
+000072F0  C1C110            rol ecx, 16               ; Swap counters
+000072F3  EBE9              jmp .nextModRM
+
+.loop:
+000072F5  67E29A            a16 loop .calcModRMValues ; Decrement CX (ModRM counter)
+    ; All tests complete
+000072F8  C3                ret
+
+================================================================================
+addr32CalcLEAValues - Calculate LEA Instruction Encoding (lines 15456-15513)
+================================================================================
+
+addr32CalcLEAValues:
+    ; Determine if SIB byte is needed
+000072F9  89C5              mov ebp, eax
+000072FB  83E507            and ebp, 0x07             ; R/M field
+000072FE  83FD04            cmp ebp, 0x04             ; R/M = 100b (SIB)?
+00007301  7516              jne .noSIB
+
+.SIB:
+00007303  BF33000000        mov edi, 0x33             ; Displacement offset (after SIB)
+00007308  A900000100        test eax, 0x10000         ; Already in SIB mode?
+0000730D  750F              jnz .disp
+0000730F  0D00000100        or eax, 0x10000           ; Set SIB flag
+00007314  C1C110            rol ecx, 16               ; Switch to SIB loop counter
+00007317  EB05              jmp .disp
+
+.noSIB:
+00007319  BF32000000        mov edi, 0x32             ; Displacement offset (no SIB)
+
+.disp:
+    ; Determine displacement type based on Mod field
+0000731E  BE90909090        mov esi, 0x90909090       ; Init with NOPs
+00007323  89C5              mov ebp, eax
+00007325  C1ED06            shr ebp, 6
+00007328  83E503            and ebp, 0x03             ; Mod field
+0000732B  83FD01            cmp ebp, 0x01             ; Mod = 01 (disp8)?
+0000732E  7428              je .disp8
+00007330  83FD02            cmp ebp, 0x02             ; Mod = 10 (disp32)?
+00007333  7430              je .disp32
+00007335  83FD03            cmp ebp, 0x03             ; Mod = 11 (register)?
+00007338  7432              je .lastByte
+
+    ; Mod = 00: Check for special cases
+0000733A  89C5              mov ebp, eax
+0000733C  83E507            and ebp, 0x07             ; R/M field
+0000733F  83FD05            cmp ebp, 0x05             ; R/M = 101 (disp32 only)?
+00007342  7421              je .disp32
+00007344  83FD04            cmp ebp, 0x04             ; R/M = 100 (SIB)?
+00007347  7523              jne .lastByte
+    ; Check SIB Base field for special case
+00007349  89C5              mov ebp, eax
+0000734B  C1ED08            shr ebp, 8
+0000734E  83E507            and ebp, 0x07             ; SIB Base field
+00007351  83FD05            cmp ebp, 0x05             ; Base = 101 (disp32)?
+00007354  740F              je .disp32
+00007356  EB14              jmp .lastByte
+
+.disp8:
+00007358  BE80000000        mov esi, 0x80             ; disp8 value = -128
+0000735D  81CE00909090      or esi, 0x90909000        ; Pad with NOPs
+00007363  EB07              jmp .lastByte
+
+.disp32:
+00007365  BE00000080        mov esi, 0x80000000       ; disp32 value = -2147483648
+
+.lastByte:
+0000736C  B790              mov bh, 0x90              ; Default: NOP
+0000736E  A900000100        test eax, 0x10000         ; SIB present?
+00007373  740E              jz .return
+00007375  26893500000000    mov [es:0], esi           ; Store displacement
+0000737C  268A3D03000000    mov bh, [es:3]            ; Get last byte
+
+.return:
+00007383  C3                ret
+
+================================================================================
+addr32CalcCMPValues - Calculate Expected Result Address (lines 15516-15552)
+================================================================================
+
+addr32CalcCMPValues:
+    ; Build CMP ModRM byte (uses register from LEA result)
+00007384  88C3              mov bl, al
+00007386  C0EB03            shr bl, 3
+00007389  80E307            and bl, 0x07              ; Extract Reg field
+0000738C  80CB38            or bl, 0x38               ; CMP opcode /7
+0000738F  80CBC0            or bl, 0xC0               ; Mod = 11 (register)
+
+    ; Calculate index into expected values table
+00007392  31D2              xor edx, edx
+00007394  88C2              mov dl, al
+00007396  80E207            and dl, 0x07              ; R/M field
+00007399  88C6              mov dh, al
+0000739B  C0EE06            shr dh, 6                 ; Mod field
+0000739E  C0E603            shl dh, 3                 ; Mod * 8
+000073A1  00F2              add dl, dh                ; Index = Mod*8 + R/M
+000073A3  BD[16740000]      mov ebp, addr32Values     ; Base table address
+
+    ; If SIB is used, switch to SIB tables
+000073A8  A900000100        test eax, 0x10000         ; SIB present?
+000073AD  7413              jz .return
+
+    ; Calculate SIB table index
+000073AF  88E2              mov dl, ah                ; SIB byte = index
+000073B1  89C5              mov ebp, eax
+000073B3  C1ED06            shr ebp, 6
+000073B6  83E503            and ebp, 0x03             ; Mod field
+000073B9  C1E50A            shl ebp, 10               ; * 1024 (256 entries * 4 bytes)
+000073BC  81C5[76740000]    add ebp, addr32ValuesSIB00
+
+.return:
+000073C2  C3                ret
+
+================================================================================
+addr32CalcMOVValues - Calculate MOV Instruction Encoding (lines 15555-15560)
+================================================================================
+
+addr32CalcMOVValues:
+000073C3  88C6              mov dh, al
+000073C5  80E638            and dh, 0x38              ; Extract Reg field from LEA
+000073C8  80CE05            or dh, 0x05               ; R/M = 101 (disp32)
+000073CB  C3                ret                       ; Mod = 00 (memory)
+
+================================================================================
+addr32CopyValues - Write Values to Test Routine (lines 15563-15573)
+================================================================================
+
+addr32CopyValues:
+000073CC  A231000000        mov [leaModRMOff], al     ; Write LEA ModRM
+000073D1  882532000000      mov [leaSIBDispOff], ah   ; Write SIB or disp
+000073D7  8937              mov [edi], esi            ; Write displacement
+000073D9  883D36000000      mov [leaLastByteOff], bh  ; Write last byte
+000073DF  881D38000000      mov [cmpModRMOff], bl     ; Write CMP ModRM
+000073E5  88353F000000      mov [movModRMOff], dh     ; Write MOV ModRM
+000073EB  81E2FF000000      and edx, 0xFF             ; Table index
+000073F1  2E8B549500        mov edx, [cs:ebp+edx*4]   ; Load expected value
+000073F6  891539000000      mov [cmpImm32Off], edx    ; Write to CMP immediate
+000073FC  C3                ret
+
+================================================================================
+addr32TestCode - Dynamic Test Routine Template (lines 15292-15334)
+================================================================================
+
+This code is copied to RAM and modified for each addressing mode test:
+
+addr32TestCode:
+000071F3  60                pushad                    ; Save all registers
+000071F4  26892504000000    mov [es:4], esp           ; Save ESP
+
+    ; Load test register values for effective address calculation
+000071FB  B801000000        mov eax, 0x001            ; EAX = 1
+00007200  BB02000000        mov ebx, 0x002            ; EBX = 2
+00007205  B904000000        mov ecx, 0x004            ; ECX = 4
+0000720A  BA08000000        mov edx, 0x008            ; EDX = 8
+0000720F  BC20000000        mov esp, 0x020            ; ESP = 32
+00007214  BD40000000        mov ebp, 0x040            ; EBP = 64
+00007219  BE80000000        mov esi, 0x080            ; ESI = 128
+0000721E  BF00010000        mov edi, 0x100            ; EDI = 256
+
+    ; LEA instruction (dynamically modified)
+00007223  8D                db 0x8D                   ; LEA opcode
+00007224  00                .leaModRM:   db 0x00      ; ModRM (modified)
+00007225  90                .leaSIBDisp: db 0x90      ; SIB/disp (modified)
+00007226  909090            .leaDisp:    db 0x90,0x90,0x90  ; Displacement
+00007229  90                .leaLastByte:db 0x90      ; Last byte (if needed)
+
+    ; CMP instruction (verify result)
+0000722A  81                db 0x81                   ; CMP opcode (imm32)
+0000722B  00                .cmpModRM:   db 0x00      ; ModRM (modified)
+0000722C  00000000          .cmpImm32:   dd 0         ; Expected value (modified)
+
+    ; MOV instruction (store result for debugging)
+00007230  26                db 0x26                   ; ES prefix
+00007231  89                db 0x89                   ; MOV r/m32,r32
+00007232  00                .movModRM:   db 0x00      ; ModRM (modified)
+00007233  00000000          dd 0                      ; disp32
+
+00007237  268B2504000000    mov esp, [es:4]           ; Restore ESP
+0000723E  7407              je .exit                  ; If CMP passed, exit
+00007240  9A[A7F00000]1000  call C_SEG_PROT32:error   ; Otherwise, report error
+
+.exit:
+00007247  61                popad                     ; Restore registers
+00007248  CB                retf
+.end:
+
+================================================================================
+Expected Values Tables (lines 15595-16490)
+================================================================================
+
+The expected results are pre-computed for all addressing mode combinations.
+Register values used: EAX=1, EBX=2, ECX=4, EDX=8, ESP=32, EBP=64, ESI=128, EDI=256
+Displacement values: disp8=0x80 (-128), disp32=0x80000000 (-2147483648)
+
+addr32Values: (ModRM without SIB - 24 entries for Mod=00,01,10)
+---------------------------------------------------------------------
+; Mod=00: [register] (direct register addressing)
+00007416  01000000          dd 0x00000001  ; 00: [EAX]
+0000741A  04000000          dd 0x00000004  ; 01: [ECX]
+0000741E  08000000          dd 0x00000008  ; 02: [EDX]
+00007422  02000000          dd 0x00000002  ; 03: [EBX]
+00007426  00000000          dd 0x00000000  ; 04: (SIB placeholder)
+0000742A  00000080          dd 0x80000000  ; 05: [disp32]
+0000742E  80000000          dd 0x00000080  ; 06: [ESI]
+00007432  00010000          dd 0x00000100  ; 07: [EDI]
+
+; Mod=01: [register + disp8]
+00007436  81FFFFFF          dd 0xFFFFFF81  ; 40: [EAX-128]
+0000743A  84FFFFFF          dd 0xFFFFFF84  ; 41: [ECX-128]
+0000743E  88FFFFFF          dd 0xFFFFFF88  ; 42: [EDX-128]
+00007442  82FFFFFF          dd 0xFFFFFF82  ; 43: [EBX-128]
+00007446  00000000          dd 0x00000000  ; 44: (SIB placeholder)
+0000744A  C0FFFFFF          dd 0xFFFFFFC0  ; 45: [EBP-128]
+0000744E  00000000          dd 0x00000000  ; 46: [ESI-128]
+00007452  80000000          dd 0x00000080  ; 47: [EDI-128]
+
+; Mod=10: [register + disp32]
+00007456  01000080          dd 0x80000001  ; 80: [EAX+disp32]
+0000745A  04000080          dd 0x80000004  ; 81: [ECX+disp32]
+0000745E  08000080          dd 0x80000008  ; 82: [EDX+disp32]
+00007462  02000080          dd 0x80000002  ; 83: [EBX+disp32]
+00007466  00000000          dd 0x00000000  ; 84: (SIB placeholder)
+0000746A  40000080          dd 0x80000040  ; 85: [EBP+disp32]
+0000746E  80000080          dd 0x80000080  ; 86: [ESI+disp32]
+00007472  00010080          dd 0x80000100  ; 87: [EDI+disp32]
+
+addr32ValuesSIB00: (SIB with Mod=00 - 256 entries)
+---------------------------------------------------------------------
+SIB byte format: [Scale:2][Index:3][Base:3]
+  Scale: 00=*1, 01=*2, 10=*4, 11=*8
+  Index: Register index (4=none)
+  Base:  Register base (5=disp32 with Mod=00)
+
+Sample entries showing SIB addressing:
+00007476  02000000          dd 0x00000002  ; SIB=00: [EAX+EAX*1] = 1+1 = 2
+0000747A  05000000          dd 0x00000005  ; SIB=01: [ECX+EAX*1] = 4+1 = 5
+0000748A  01000080          dd 0x80000001  ; SIB=05: [disp32+EAX*1]
+00007496  05000000          dd 0x00000005  ; SIB=08: [EAX+ECX*1] = 1+4 = 5
+000074B6  09000000          dd 0x00000009  ; SIB=10: [EAX+EDX*1] = 1+8 = 9
+...
+
+addr32ValuesSIB01: (SIB with Mod=01 - 256 entries, disp8 added)
+---------------------------------------------------------------------
+00007876  82FFFFFF          dd 0xFFFFFF82  ; [EAX+EAX*1-128] = 1+1-128 = -126
+...
+
+addr32ValuesSIB10: (SIB with Mod=10 - 256 entries, disp32 added)
+---------------------------------------------------------------------
+00007C76  02000080          dd 0x80000002  ; [EAX+EAX*1+disp32]
+...
+
+================================================================================
+x86 32-bit Addressing Mode Reference
+================================================================================
+
+ModRM Byte Format:
+  Bits 7-6: Mod (addressing mode)
+    00 = [reg] or [disp32] or [SIB]
+    01 = [reg + disp8] or [SIB + disp8]
+    10 = [reg + disp32] or [SIB + disp32]
+    11 = reg (register direct) - INVALID for LEA
+
+  Bits 5-3: Reg/Opcode (destination register for LEA)
+    000=EAX, 001=ECX, 010=EDX, 011=EBX
+    100=ESP, 101=EBP, 110=ESI, 111=EDI
+
+  Bits 2-0: R/M (source addressing)
+    000=EAX, 001=ECX, 010=EDX, 011=EBX
+    100=SIB follows, 101=EBP (or disp32 if Mod=00)
+    110=ESI, 111=EDI
+
+SIB Byte Format (when R/M = 100):
+  Bits 7-6: Scale (index multiplier)
+    00=*1, 01=*2, 10=*4, 11=*8
+
+  Bits 5-3: Index (scaled register)
+    000=EAX, 001=ECX, 010=EDX, 011=EBX
+    100=none (no index), 101=EBP, 110=ESI, 111=EDI
+
+  Bits 2-0: Base (base register)
+    000=EAX, 001=ECX, 010=EDX, 011=EBX
+    100=ESP, 101=EBP (or disp32 if Mod=00), 110=ESI, 111=EDI
+
+Special Cases:
+  - Mod=00, R/M=101: [disp32] - no register, just 32-bit displacement
+  - Mod=00, R/M=100, Base=101: [Index*Scale + disp32] - no base register
+  - Index=100 (ESP) with any Scale: Undefined behavior (not tested)
+
+================================================================================
+Test Register Values
+================================================================================
+
+  EAX = 0x00000001 (1)
+  ECX = 0x00000004 (4)
+  EDX = 0x00000008 (8)
+  EBX = 0x00000002 (2)
+  ESP = 0x00000020 (32)
+  EBP = 0x00000040 (64)
+  ESI = 0x00000080 (128)
+  EDI = 0x00000100 (256)
+
+  disp8  = 0x80 (-128 signed)
+  disp32 = 0x80000000 (-2147483648 signed)
+
+================================================================================
+Segment Selectors Used
+================================================================================
+
+  C_SEG_PROT32  = 0x10   Code segment (32-bit protected mode)
+  D1_SEG_PROT   = 0x1C   Data segment 1 (writable, for test code)
+  D2_SEG_PROT   = 0x24   Data segment 2 (scratch pad)
+  DC_SEG_PROT32 = 0x2C   Dynamic code segment (executable copy of test)
+
+================================================================================
+Summary
+================================================================================
+
+POST E comprehensively tests the x86 32-bit addressing mode calculation logic
+by exercising every valid ModRM byte value (0x00-0xBF) and all SIB byte
+combinations (0x00-0xFF) where applicable. The test:
+
+1. Copies a test routine template to writable memory
+2. Dynamically patches the LEA instruction's ModRM and SIB bytes
+3. Executes the patched code to compute an effective address
+4. Compares the computed EA against pre-calculated expected values
+5. Reports an error if any mismatch is detected
+
+This provides exhaustive coverage of the complex x86 addressing mode logic,
+including edge cases like:
+- disp32-only addressing (Mod=00, R/M=101)
+- SIB with no base register (Mod=00, Base=101)
+- All scale factors (*1, *2, *4, *8)
+- Negative displacements (disp8=-128, disp32=-2147483648)
